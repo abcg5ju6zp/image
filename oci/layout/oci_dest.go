@@ -12,11 +12,11 @@ import (
 	"runtime"
 	"slices"
 
+	"github.com/containers/image/v5/internal/blobwriter"
 	"github.com/containers/image/v5/internal/imagedestination/impl"
 	"github.com/containers/image/v5/internal/imagedestination/stubs"
 	"github.com/containers/image/v5/internal/manifest"
 	"github.com/containers/image/v5/internal/private"
-	"github.com/containers/image/v5/internal/putblobdigest"
 	"github.com/containers/image/v5/types"
 	"github.com/containers/storage/pkg/fileutils"
 	digest "github.com/opencontainers/go-digest"
@@ -94,6 +94,12 @@ func newImageDestination(sys *types.SystemContext, ref ociReference) (private.Im
 	if err := ensureDirectoryExists(filepath.Join(d.ref.dir, imgspecv1.ImageBlobsDir)); err != nil {
 		return nil, err
 	}
+	// Remove unconfirmed staging files left behind in the layout by writers
+	// that never completed a commit (e.g. after a crash or a network
+	// disconnect). Active writers are protected by the shared staging lock.
+	if err := blobwriter.CleanupStaging(d.ref.dir); err != nil {
+		return nil, err
+	}
 	return d, nil
 }
 
@@ -115,40 +121,37 @@ func (d *ociImageDestination) Close() error {
 // WARNING: The contents of stream are being verified on the fly.  Until stream.Read() returns io.EOF, the contents of the data SHOULD NOT be available
 // to any other readers for download using the supplied digest.
 // If stream.Read() at any time, ESPECIALLY at end of input, returns an error, PutBlobWithOptions MUST 1) fail, and 2) delete any data stored so far.
-func (d *ociImageDestination) PutBlobWithOptions(ctx context.Context, stream io.Reader, inputInfo types.BlobInfo, options private.PutBlobOptions) (_ private.UploadedBlob, retErr error) {
-	blobFile, err := os.CreateTemp(d.ref.dir, "oci-put-blob")
-	if err != nil {
-		return private.UploadedBlob{}, err
-	}
-	succeeded := false
-	explicitClosed := false
-	defer func() {
-		if !explicitClosed {
-			closeErr := blobFile.Close()
-			if retErr == nil {
-				retErr = closeErr
+func (d *ociImageDestination) PutBlobWithOptions(ctx context.Context, stream io.Reader, inputInfo types.BlobInfo, options private.PutBlobOptions) (private.UploadedBlob, error) {
+	// Stage the blob as one recoverable commit: the temporary file becomes a
+	// reusable blob only after its size and digest have been verified, it has
+	// been fsync'ed, and it is published at its final path. Network retries
+	// get independent writers (independent temporary files).
+	writer, err := blobwriter.New(d.ref.dir, &blobwriter.Options{
+		ExpectedDigest: inputInfo.Digest,
+		ExpectedSize:   inputInfo.Size,
+		FinalPath: func(computed digest.Digest) (string, error) {
+			blobPath, err := d.ref.blobPath(computed, d.sharedBlobDir)
+			if err != nil {
+				return "", err
 			}
-		}
-		if !succeeded {
-			os.Remove(blobFile.Name())
-		}
-	}()
-
-	digester, stream := putblobdigest.DigestIfCanonicalUnknown(stream, inputInfo)
-	// TODO: This can take quite some time, and should ideally be cancellable using ctx.Done().
-	size, err := io.Copy(blobFile, stream)
+			if err := ensureParentDirectoryExists(blobPath); err != nil {
+				return "", err
+			}
+			return blobPath, nil
+		},
+	})
 	if err != nil {
 		return private.UploadedBlob{}, err
 	}
-	blobDigest := digester.Digest()
-	if inputInfo.Size != -1 && size != inputInfo.Size {
-		return private.UploadedBlob{}, fmt.Errorf("Size mismatch when copying %s, expected %d, got %d", blobDigest, inputInfo.Size, size)
-	}
-
-	if err := d.blobFileSyncAndRename(blobFile, blobDigest, &explicitClosed); err != nil {
+	defer writer.Close()
+	// TODO: This can take quite some time, and should ideally be cancellable using ctx.Done().
+	if _, err := io.Copy(writer, stream); err != nil {
 		return private.UploadedBlob{}, err
 	}
-	succeeded = true
+	blobDigest, size, err := writer.Commit()
+	if err != nil {
+		return private.UploadedBlob{}, err
+	}
 	return private.UploadedBlob{Digest: blobDigest, Size: size}, nil
 }
 

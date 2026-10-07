@@ -69,6 +69,31 @@ func TestPutBlobDigestFailure(t *testing.T) {
 	require.True(t, os.IsNotExist(err))
 }
 
+// TestReopenCleansUnconfirmedStagingFiles verifies that opening a destination
+// removes unconfirmed staging files left by writers that never committed
+// (e.g. after a crash or network disconnect), while other files survive.
+func TestReopenCleansUnconfirmedStagingFiles(t *testing.T) {
+	ref, tmpDir := refToTempOCI(t, false)
+
+	stagingFile, err := os.CreateTemp(tmpDir, ".blobwriter-ingest-*")
+	require.NoError(t, err)
+	_, err = stagingFile.Write([]byte("short write, never committed"))
+	require.NoError(t, err)
+	require.NoError(t, stagingFile.Close())
+
+	dest, err := ref.NewImageDestination(context.Background(), nil)
+	require.NoError(t, err)
+	defer dest.Close()
+
+	if _, err := os.Lstat(stagingFile.Name()); !os.IsNotExist(err) {
+		t.Errorf("unconfirmed staging file %q not cleaned on reopen: %v", stagingFile.Name(), err)
+	}
+	// The index is unrelated to staging files and must remain.
+	if _, err := os.Stat(filepath.Join(tmpDir, "index.json")); err != nil {
+		t.Errorf("index.json removed while cleaning staging files: %v", err)
+	}
+}
+
 // TestPutManifestAppendsToExistingManifest tests that new manifests are getting added to existing index.
 func TestPutManifestAppendsToExistingManifest(t *testing.T) {
 	ref, tmpDir := refToTempOCI(t, false)

@@ -1,0 +1,25 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: "声明长度、实际字节数和 digest 不一致时 blob 不可复用。"
+  - id: 2
+    type: f2p
+    text: "候选文件完成写入、关闭和同步后才登记为已确认 blob。"
+  - id: 3
+    type: f2p
+    text: "短写、尾随内容、断连或 fsync 失败会清理候选且不影响旧 blob。"
+  - id: 4
+    type: f2p
+    text: "并发 writer 互不覆盖，失败 writer 不能删除较早确认的相同 digest。"
+  - id: 5
+    type: f2p
+    text: "重启或重新打开目标会清理未确认临时文件并保留确认索引。"
+  - id: 6
+    type: f2p
+    text: "重试会复用正确 digest 的确认 blob，不重复写入已确认内容。"
+  - id: 7
+    type: p2p
+    text: "压缩、加密、分块和 seek 读取保持原有结果。"
+  - id: 8
+    type: p2p
+    text: "普通 PutBlob 和完整镜像读取不发生回归。"

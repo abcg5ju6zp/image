@@ -64,7 +64,9 @@ func TestGetPutManifest(t *testing.T) {
 func TestGetPutBlob(t *testing.T) {
 	computedBlob := []byte("test-blob")
 	providedBlob := []byte("provided-blob")
-	providedDigest := digest.Digest("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	// The declared digest must match the blob contents; a mismatching digest
+	// must not be accepted as a reusable blob.
+	providedDigest := digest.FromBytes(providedBlob)
 
 	ref, _ := refToTempDir(t)
 	cache := memory.New()
@@ -100,6 +102,34 @@ func TestGetPutBlob(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, expectedBlob, b)
 		assert.Equal(t, int64(len(expectedBlob)), size)
+	}
+}
+
+// TestReopenCleansUnconfirmedStagingFiles verifies that opening a destination
+// removes unconfirmed staging files left by writers that never committed
+// (e.g. after a crash or network disconnect).
+func TestReopenCleansUnconfirmedStagingFiles(t *testing.T) {
+	ref, tmpDir := refToTempDir(t)
+
+	// First open establishes the version structure.
+	dest, err := ref.NewImageDestination(context.Background(), nil)
+	require.NoError(t, err)
+	require.NoError(t, dest.Close())
+
+	// A crashed writer leaves an unconfirmed staging file behind.
+	stagingFile, err := os.CreateTemp(tmpDir, ".blobwriter-ingest-*")
+	require.NoError(t, err)
+	_, err = stagingFile.Write([]byte("short write, never committed"))
+	require.NoError(t, err)
+	require.NoError(t, stagingFile.Close())
+
+	// Reopening the destination must clean it up.
+	dest, err = ref.NewImageDestination(context.Background(), nil)
+	require.NoError(t, err)
+	defer dest.Close()
+
+	if _, err := os.Lstat(stagingFile.Name()); !os.IsNotExist(err) {
+		t.Errorf("unconfirmed staging file %q not cleaned on reopen: %v", stagingFile.Name(), err)
 	}
 }
 

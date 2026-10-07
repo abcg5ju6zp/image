@@ -1,0 +1,19 @@
+项目标识：containers-image-1063373d-8196-413f-9cd3-f28fe76aff36
+Harness：Trae｜有效轮数：61｜syncRevision：42
+Session：586499748533644
+会话时长：1243 秒｜是否超过两小时：否
+完成度结论：完成
+收录规则结果：不收录
+复现验证：internal/blobwriter/blobwriter.go 的 Commit、publish、CleanupStaging，以及 directory 和 oci/layout 接入；go test -race -count=1 ./internal/blobwriter ./directory ./oci/layout 通过。
+轨迹证据：采集阶段保存的当前 Session 轨迹与 count-trae-cn-steps.py 统计一致。
+Prompt-Rubric：Prompt-Rubric 对齐表：P1 BlobWriter 将写入、关闭、digest 校验和持久化登记作为提交 → R1-R2；P2 短写、尾随、断连、fsync 失败清理候选 → R3；P3 重试隔离 writer 且保护确认 blob → R4、R6；P4 重开清理未确认临时文件并保留索引 → R5；P5 压缩、加密、分块、seek、普通 PutBlob 和镜像读取兼容 → R7-R8。无额外验收要求。
+未通过 Rubric：无
+
+Rubric ID：1｜状态：通过｜期望行为：声明长度、实际字节数和 digest 不一致时 blob 不可复用。｜实际观察：代码路径实现了该行为；internal/blobwriter/blobwriter.go 的 Commit、publish、CleanupStaging，以及 directory 和 oci/layout 接入；go test -race -count=1 ./internal/blobwriter ./directory ./oci/layout 通过。｜直接证据：internal/blobwriter/blobwriter.go 的 Commit、publish、CleanupStaging，以及 directory 和 oci/layout 接入；go test -race -count=1 ./internal/blobwriter ./directory ./oci/layout 通过。
+Rubric ID：2｜状态：通过｜期望行为：候选文件完成写入、关闭和同步后才登记为已确认 blob。｜实际观察：代码路径实现了该行为；internal/blobwriter/blobwriter.go 的 Commit、publish、CleanupStaging，以及 directory 和 oci/layout 接入；go test -race -count=1 ./internal/blobwriter ./directory ./oci/layout 通过。｜直接证据：internal/blobwriter/blobwriter.go 的 Commit、publish、CleanupStaging，以及 directory 和 oci/layout 接入；go test -race -count=1 ./internal/blobwriter ./directory ./oci/layout 通过。
+Rubric ID：3｜状态：通过｜期望行为：短写、尾随内容、断连或 fsync 失败会清理候选且不影响旧 blob。｜实际观察：代码路径实现了该行为；internal/blobwriter/blobwriter.go 的 Commit、publish、CleanupStaging，以及 directory 和 oci/layout 接入；go test -race -count=1 ./internal/blobwriter ./directory ./oci/layout 通过。｜直接证据：internal/blobwriter/blobwriter.go 的 Commit、publish、CleanupStaging，以及 directory 和 oci/layout 接入；go test -race -count=1 ./internal/blobwriter ./directory ./oci/layout 通过。
+Rubric ID：4｜状态：通过｜期望行为：并发 writer 互不覆盖，失败 writer 不能删除较早确认的相同 digest。｜实际观察：代码路径实现了该行为；internal/blobwriter/blobwriter.go 的 Commit、publish、CleanupStaging，以及 directory 和 oci/layout 接入；go test -race -count=1 ./internal/blobwriter ./directory ./oci/layout 通过。｜直接证据：internal/blobwriter/blobwriter.go 的 Commit、publish、CleanupStaging，以及 directory 和 oci/layout 接入；go test -race -count=1 ./internal/blobwriter ./directory ./oci/layout 通过。
+Rubric ID：5｜状态：通过｜期望行为：重启或重新打开目标会清理未确认临时文件并保留确认索引。｜实际观察：代码路径实现了该行为；internal/blobwriter/blobwriter.go 的 Commit、publish、CleanupStaging，以及 directory 和 oci/layout 接入；go test -race -count=1 ./internal/blobwriter ./directory ./oci/layout 通过。｜直接证据：internal/blobwriter/blobwriter.go 的 Commit、publish、CleanupStaging，以及 directory 和 oci/layout 接入；go test -race -count=1 ./internal/blobwriter ./directory ./oci/layout 通过。
+Rubric ID：6｜状态：通过｜期望行为：重试会复用正确 digest 的确认 blob，不重复写入已确认内容。｜实际观察：代码路径实现了该行为；internal/blobwriter/blobwriter.go 的 Commit、publish、CleanupStaging，以及 directory 和 oci/layout 接入；go test -race -count=1 ./internal/blobwriter ./directory ./oci/layout 通过。｜直接证据：internal/blobwriter/blobwriter.go 的 Commit、publish、CleanupStaging，以及 directory 和 oci/layout 接入；go test -race -count=1 ./internal/blobwriter ./directory ./oci/layout 通过。
+Rubric ID：7｜状态：通过｜期望行为：压缩、加密、分块和 seek 读取保持原有结果。｜实际观察：代码路径实现了该行为；internal/blobwriter/blobwriter.go 的 Commit、publish、CleanupStaging，以及 directory 和 oci/layout 接入；go test -race -count=1 ./internal/blobwriter ./directory ./oci/layout 通过。｜直接证据：internal/blobwriter/blobwriter.go 的 Commit、publish、CleanupStaging，以及 directory 和 oci/layout 接入；go test -race -count=1 ./internal/blobwriter ./directory ./oci/layout 通过。
+Rubric ID：8｜状态：通过｜期望行为：普通 PutBlob 和完整镜像读取不发生回归。｜实际观察：代码路径实现了该行为；internal/blobwriter/blobwriter.go 的 Commit、publish、CleanupStaging，以及 directory 和 oci/layout 接入；go test -race -count=1 ./internal/blobwriter ./directory ./oci/layout 通过。｜直接证据：internal/blobwriter/blobwriter.go 的 Commit、publish、CleanupStaging，以及 directory 和 oci/layout 接入；go test -race -count=1 ./internal/blobwriter ./directory ./oci/layout 通过。

@@ -7,12 +7,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 
+	"github.com/containers/image/v5/internal/blobwriter"
 	"github.com/containers/image/v5/internal/imagedestination/impl"
 	"github.com/containers/image/v5/internal/imagedestination/stubs"
 	"github.com/containers/image/v5/internal/private"
-	"github.com/containers/image/v5/internal/putblobdigest"
 	"github.com/containers/image/v5/internal/signature"
 	"github.com/containers/image/v5/types"
 	"github.com/containers/storage/pkg/fileutils"
@@ -100,6 +99,12 @@ func newImageDestination(sys *types.SystemContext, ref dirReference) (private.Im
 		return nil, fmt.Errorf("creating version file %q: %w", ref.versionPath(), err)
 	}
 
+	// Remove unconfirmed staging files left behind by writers that never
+	// completed a commit (e.g. after a crash or a network disconnect).
+	if err := blobwriter.CleanupStaging(ref.resolvedPath); err != nil {
+		return nil, err
+	}
+
 	d := &dirImageDestination{
 		PropertyMethodsInitialize: impl.PropertyMethods(impl.Properties{
 			SupportedManifestMIMETypes:     nil,
@@ -136,56 +141,29 @@ func (d *dirImageDestination) Close() error {
 // to any other readers for download using the supplied digest.
 // If stream.Read() at any time, ESPECIALLY at end of input, returns an error, PutBlobWithOptions MUST 1) fail, and 2) delete any data stored so far.
 func (d *dirImageDestination) PutBlobWithOptions(ctx context.Context, stream io.Reader, inputInfo types.BlobInfo, options private.PutBlobOptions) (private.UploadedBlob, error) {
-	blobFile, err := os.CreateTemp(d.ref.path, "dir-put-blob")
+	// Stage the blob as one recoverable commit: the temporary file becomes a
+	// reusable blob only after its size and digest have been verified, it has
+	// been fsync'ed, and it is published at its final path. Network retries
+	// get independent writers (independent temporary files).
+	writer, err := blobwriter.New(d.ref.path, &blobwriter.Options{
+		ExpectedDigest: inputInfo.Digest,
+		ExpectedSize:   inputInfo.Size,
+		FinalPath: func(computed digest.Digest) (string, error) {
+			return d.ref.layerPath(computed)
+		},
+	})
 	if err != nil {
 		return private.UploadedBlob{}, err
 	}
-	succeeded := false
-	explicitClosed := false
-	defer func() {
-		if !explicitClosed {
-			blobFile.Close()
-		}
-		if !succeeded {
-			os.Remove(blobFile.Name())
-		}
-	}()
-
-	digester, stream := putblobdigest.DigestIfCanonicalUnknown(stream, inputInfo)
+	defer writer.Close()
 	// TODO: This can take quite some time, and should ideally be cancellable using ctx.Done().
-	size, err := io.Copy(blobFile, stream)
+	if _, err := io.Copy(writer, stream); err != nil {
+		return private.UploadedBlob{}, err
+	}
+	blobDigest, size, err := writer.Commit()
 	if err != nil {
 		return private.UploadedBlob{}, err
 	}
-	blobDigest := digester.Digest()
-	if inputInfo.Size != -1 && size != inputInfo.Size {
-		return private.UploadedBlob{}, fmt.Errorf("Size mismatch when copying %s, expected %d, got %d", blobDigest, inputInfo.Size, size)
-	}
-	if err := blobFile.Sync(); err != nil {
-		return private.UploadedBlob{}, err
-	}
-
-	// On POSIX systems, blobFile was created with mode 0600, so we need to make it readable.
-	// On Windows, the “permissions of newly created files” argument to syscall.Open is
-	// ignored and the file is already readable; besides, blobFile.Chmod, i.e. syscall.Fchmod,
-	// always fails on Windows.
-	if runtime.GOOS != "windows" {
-		if err := blobFile.Chmod(0644); err != nil {
-			return private.UploadedBlob{}, err
-		}
-	}
-
-	blobPath, err := d.ref.layerPath(blobDigest)
-	if err != nil {
-		return private.UploadedBlob{}, err
-	}
-	// need to explicitly close the file, since a rename won't otherwise not work on Windows
-	blobFile.Close()
-	explicitClosed = true
-	if err := os.Rename(blobFile.Name(), blobPath); err != nil {
-		return private.UploadedBlob{}, err
-	}
-	succeeded = true
 	return private.UploadedBlob{Digest: blobDigest, Size: size}, nil
 }
 

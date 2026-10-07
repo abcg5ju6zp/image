@@ -1,0 +1,5 @@
+{
+  "completion": "完成",
+  "fails": {},
+  "evidence": "internal/blobwriter/blobwriter.go 的 Commit、publish、CleanupStaging，以及 directory 和 oci/layout 接入；go test -race -count=1 ./internal/blobwriter ./directory ./oci/layout 通过。"
+}
