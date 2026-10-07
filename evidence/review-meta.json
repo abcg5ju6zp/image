@@ -1,7 +1,5 @@
 {
-  "completion": "部分完成",
-  "fails": {
-    "3": "writeCandidate 在 syncDirectory 失败时忽略错误并仍切换 current；目录同步失败不会传回主流程，旧策略不再保持为活动策略。"
-  },
-  "evidence": "signature/policy_store.go 的 ValidatePolicy、commit、writeCandidate；PolicyStore 专项代码审计完成，完整 signature 测试被本机缺少 gpgconf/pkg-config 阻断。"
+  "completion": "完成",
+  "fails": {},
+  "evidence": "signature/policy_store.go 的 commit、writeCandidate 和 syncDirectory 现会传回目录同步错误；完整 signature 测试仍被本机缺少 gpgconf/pkg-config 阻断。"
 }
