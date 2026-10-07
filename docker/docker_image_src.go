@@ -721,18 +721,8 @@ func deleteImage(ctx context.Context, sys *types.SystemContext, ref dockerRefere
 		return fmt.Errorf("deleting %v: %w", ref.ref, registryHTTPResponseToError(delete))
 	}
 
-	for i := 0; ; i++ {
-		sigURL, err := lookasideStorageURL(c.signatureBase, manifestDigest, i)
-		if err != nil {
-			return err
-		}
-		missing, err := c.deleteOneSignature(sigURL)
-		if err != nil {
-			return err
-		}
-		if missing {
-			break
-		}
+	if err := c.deleteLookasideSignatureSet(manifestDigest); err != nil {
+		return err
 	}
 
 	return nil

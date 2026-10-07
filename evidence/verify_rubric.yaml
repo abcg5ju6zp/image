@@ -1,0 +1,25 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: "向带 lookaside 签名的 Docker registry 更新同一镜像签名时,1,f2p,签名集合更新具有单次提交语义"
+  - id: 2
+    type: f2p
+    text: "签名按序逐个覆盖并在末尾删除旧文件,2,f2p,不会让读取端观察到中间集合"
+  - id: 3
+    type: f2p
+    text: "先在隔离位置写完并校验全部签名,3,f2p,发布前全部新签名已写入并校验"
+  - id: 4
+    type: f2p
+    text: "再让读取端只看到完整的新集合,4,f2p,读取端只看到旧集合或完整新集合"
+  - id: 5
+    type: f2p
+    text: "失败或取消保留上一集合，重试清理未发布临时对象,5,f2p,失败恢复不丢旧签名且重试不留未发布对象"
+  - id: 6
+    type: f2p
+    text: "文件、HTTP lookaside、API 扩展和 sigstore 附件的既有选择,6,p2p,各签名后端仍按既有选择工作"
+  - id: 7
+    type: f2p
+    text: "普通无签名复制继续兼容,7,p2p,没有签名的普通复制不回归"
+  - id: 8
+    type: p2p
+    text: "丢失可验证签名,8,f2p,更新后签名读取与验证结果完整"

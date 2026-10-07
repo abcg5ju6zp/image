@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"maps"
 	"net/http"
 	"net/url"
@@ -619,7 +621,7 @@ func (d *dockerImageDestination) PutSignaturesWithFormat(ctx context.Context, si
 				return err
 			}
 		case d.c.signatureBase != nil:
-			if err := d.putSignaturesToLookaside(otherSignatures, *instanceDigest); err != nil {
+			if err := d.putSignaturesToLookaside(ctx, otherSignatures, *instanceDigest); err != nil {
 				return err
 			}
 		default:
@@ -632,72 +634,387 @@ func (d *dockerImageDestination) PutSignaturesWithFormat(ctx context.Context, si
 
 // putSignaturesToLookaside implements PutSignaturesWithFormat() from the lookaside location configured in s.c.signatureBase,
 // which is not nil, for a manifest with manifestDigest.
-func (d *dockerImageDestination) putSignaturesToLookaside(signatures []signature.Signature, manifestDigest digest.Digest) error {
-	// FIXME? This overwrites files one at a time, definitely not atomic.
-	// A failure when updating signatures with a reordered copy could lose some of them.
+//
+// The update is a recoverable transaction:
+//  1. All signatures are written to an isolated .set-<random> directory, synced and verified
+//     by reading them back; readers never look at this location.
+//  2. Only after that succeeds, the <digest> path (a symlink within the parent directory)
+//     is atomically replaced to point at the new set. Readers, including an HTTP server
+//     serving the same directory, see either the complete previous set, or the complete new set.
+//  3. On any failure or cancellation before the commit, the isolated directory is removed
+//     and the previous set is untouched. Staging objects of interrupted attempts, including
+//     superseded sets, are cleaned up on the next attempt (even one carrying no signatures).
+//
+// NOTE: Keep this in sync with docs/signature-protocols.md!
+func (d *dockerImageDestination) putSignaturesToLookaside(ctx context.Context, signatures []signature.Signature, manifestDigest digest.Digest) error {
+	tx, err := newLookasideSignatureTransaction(d.c.signatureBase, manifestDigest)
+	if err != nil {
+		return err
+	}
+	// Clean up unpublished/superseded temporary objects of interrupted earlier attempts.
+	// This is best effort: the transaction uses unique names, so stale objects can't affect it.
+	if err := tx.cleanupStaleObjects(); err != nil {
+		logrus.Debugf("Error cleaning up stale lookaside signature objects at %s: %v", tx.targetPath, err)
+	}
 
-	// Skip dealing with the manifest digest if not necessary.
+	// Updating with no signatures is a no-op (as it has always been): ordinary copies
+	// without signatures must not modify, or require access to, the signature storage.
 	if len(signatures) == 0 {
 		return nil
 	}
 
-	// NOTE: Keep this in sync with docs/signature-protocols.md!
-	for i, signature := range signatures {
-		sigURL, err := lookasideStorageURL(d.c.signatureBase, manifestDigest, i)
-		if err != nil {
-			return err
-		}
-		if err := d.putOneSignature(sigURL, signature); err != nil {
-			return err
-		}
+	if err := tx.stage(ctx, signatures); err != nil {
+		tx.abort()
+		return err
 	}
-	// Remove any other signatures, if present.
-	// We stop at the first missing signature; if a previous deleting loop aborted
-	// prematurely, this may not clean up all of them, but one missing signature
-	// is enough for dockerImageSource to stop looking for other signatures, so that
-	// is sufficient.
-	for i := len(signatures); ; i++ {
-		sigURL, err := lookasideStorageURL(d.c.signatureBase, manifestDigest, i)
-		if err != nil {
-			return err
-		}
-		missing, err := d.c.deleteOneSignature(sigURL)
-		if err != nil {
-			return err
-		}
-		if missing {
-			break
-		}
+	if err := tx.commit(); err != nil {
+		tx.abort()
+		return err
 	}
-
 	return nil
 }
 
-// putOneSignature stores sig to sigURL.
-// NOTE: Keep this in sync with docs/signature-protocols.md!
-func (d *dockerImageDestination) putOneSignature(sigURL *url.URL, sig signature.Signature) error {
+// lookasideSignatureTransaction represents a single in-progress update of the signature set
+// of one manifest in a file:// lookaside storage.
+//
+// On-disk layout within the transaction’s parent directory:
+//   - <baseName>                     visible path; a symlink after the first commit
+//   - <baseName>.set-<random>/       isolated fully-populated set candidate
+//   - <baseName>.link-<random>       temporary symlink used to publish a set
+//   - <baseName>.obsolete-<random>/  backup of a pre-transaction plain directory
+type lookasideSignatureTransaction struct {
+	parentDir  string // Directory containing the visible path and the temporary objects
+	baseName   string // <digest-algorithm>@<digest-value>, the visible path's base name
+	targetPath string // The visible path
+	setDir     string // Isolated directory populated by stage
+	committed  bool   // Whether the set has been published
+}
+
+// newLookasideSignatureTransaction validates the lookaside location for writing and
+// returns a transaction without modifying anything.
+func newLookasideSignatureTransaction(base lookasideStorageBase, manifestDigest digest.Digest) (*lookasideSignatureTransaction, error) {
+	// Use index 0 only to locate the directory and validate the digest.
+	sigURL, err := lookasideStorageURL(base, manifestDigest, 0)
+	if err != nil {
+		return nil, err
+	}
 	switch sigURL.Scheme {
 	case "file":
-		logrus.Debugf("Writing to %s", sigURL.Path)
-		err := os.MkdirAll(filepath.Dir(sigURL.Path), 0755)
-		if err != nil {
+		// Local file storage is the only writable primary lookaside.
+	case "http", "https":
+		return nil, fmt.Errorf("Writing directly to a %s lookaside %s is not supported. Configure a lookaside-staging: location",
+			sigURL.Scheme, sigURL.Redacted())
+	default:
+		return nil, fmt.Errorf("Unsupported scheme when writing signature to %s", sigURL.Redacted())
+	}
+
+	targetPath := filepath.Dir(sigURL.Path)
+	return &lookasideSignatureTransaction{
+		parentDir:  filepath.Dir(targetPath),
+		baseName:   filepath.Base(targetPath),
+		targetPath: targetPath,
+	}, nil
+}
+
+// stage writes all signatures to an isolated directory, syncs them, and verifies them
+// by reading the contents back. On failure the caller must call abort.
+func (tx *lookasideSignatureTransaction) stage(ctx context.Context, signatures []signature.Signature) error {
+	if err := os.MkdirAll(tx.parentDir, 0755); err != nil {
+		return fmt.Errorf("creating lookaside signature directory %s: %w", tx.parentDir, err)
+	}
+	// MkdirTemp creates the directory with mode 0700; published signature sets should
+	// be readable by the web server, so make it world-readable.
+	setDir, err := os.MkdirTemp(tx.parentDir, tx.baseName+".set-")
+	if err != nil {
+		return fmt.Errorf("creating lookaside signature staging directory: %w", err)
+	}
+	tx.setDir = setDir
+	if err := os.Chmod(setDir, 0755); err != nil {
+		return fmt.Errorf("setting permissions of lookaside signature staging directory %s: %w", setDir, err)
+	}
+
+	blobs := make([][]byte, len(signatures))
+	for i, sig := range signatures {
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 		blob, err := signature.Blob(sig)
 		if err != nil {
-			return err
+			return fmt.Errorf("preparing signature %d: %w", i+1, err)
 		}
-		err = os.WriteFile(sigURL.Path, blob, 0644)
+		blobs[i] = blob
+		sigPath := filepath.Join(setDir, fmt.Sprintf("signature-%d", i+1))
+		if err := writeAndSyncFile(sigPath, blob); err != nil {
+			return fmt.Errorf("staging signature %d: %w", i+1, err)
+		}
+	}
+
+	// Verify the complete staged set before it can be published: read every signature
+	// back from the isolated location, compare it byte-for-byte and make sure it parses.
+	for i, expected := range blobs {
+		sigPath := filepath.Join(setDir, fmt.Sprintf("signature-%d", i+1))
+		got, err := os.ReadFile(sigPath)
+		if err != nil {
+			return fmt.Errorf("verifying staged signature %d: %w", i+1, err)
+		}
+		if !bytes.Equal(got, expected) {
+			return fmt.Errorf("verifying staged signature %d: contents do not match", i+1)
+		}
+		if _, err := signature.FromBlob(got); err != nil {
+			return fmt.Errorf("verifying staged signature %d: %w", i+1, err)
+		}
+	}
+	entries, err := os.ReadDir(setDir)
+	if err != nil {
+		return fmt.Errorf("verifying staged signature set: %w", err)
+	}
+	if len(entries) != len(signatures) {
+		return fmt.Errorf("verifying staged signature set: expected %d signatures, found %d entries", len(signatures), len(entries))
+	}
+	if err := syncDirectory(setDir); err != nil {
+		// This only affects durability against an immediate power loss, not visibility;
+		// some filesystems don't support syncing directories.
+		logrus.Debugf("Error syncing lookaside signature staging directory %s: %v", setDir, err)
+	}
+	return nil
+}
+
+// commit publishes the staged set by atomically making the visible path point at it.
+// It must only be called after a successful stage.
+func (tx *lookasideSignatureTransaction) commit() error {
+	randomSuffix, err := lookasideRandomSuffix()
+	if err != nil {
+		return err
+	}
+
+	linkPath := filepath.Join(tx.parentDir, tx.baseName+".link-"+randomSuffix)
+	// Use a relative symlink: link and set live in the same parent directory, so the
+	// published tree can still be moved/copied as a whole.
+	if err := os.Symlink(filepath.Base(tx.setDir), linkPath); err != nil {
+		return fmt.Errorf("creating temporary lookaside signature link %s: %w", linkPath, err)
+	}
+	linkPublished := false
+	defer func() {
+		if !linkPublished {
+			_ = os.Remove(linkPath) // The link never replaced the visible path.
+		}
+	}()
+
+	fi, err := os.Lstat(tx.targetPath)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		// First signature set for this manifest.
+		if err := os.Rename(linkPath, tx.targetPath); err != nil {
+			return fmt.Errorf("publishing signatures to %s: %w", tx.targetPath, err)
+		}
+
+	case err != nil:
+		return fmt.Errorf("examining lookaside signature path %s: %w", tx.targetPath, err)
+
+	case fi.Mode()&os.ModeSymlink != 0:
+		// Steady state: atomically replace the symlink. rename(2) replaces the link
+		// itself (it does not follow it), so readers see the old or the new target.
+		oldSet, err := os.Readlink(tx.targetPath)
+		if err != nil {
+			return fmt.Errorf("reading lookaside signature link %s: %w", tx.targetPath, err)
+		}
+		if err := os.Rename(linkPath, tx.targetPath); err != nil {
+			return fmt.Errorf("publishing signatures to %s: %w", tx.targetPath, err)
+		}
+		tx.removeObsoletePath(filepath.Join(tx.parentDir, oldSet))
+
+	case fi.IsDir():
+		// One-time migration of a plain-directory set (created by older clients).
+		// A non-empty directory can't be renamed over, so move it aside first.
+		// A crash in the tiny window between the two renames leaves no visible path
+		// but an .obsolete- backup, which cleanupStaleObjects restores on the next attempt.
+		backupPath := filepath.Join(tx.parentDir, tx.baseName+".obsolete-"+randomSuffix)
+		if err := os.Rename(tx.targetPath, backupPath); err != nil {
+			return fmt.Errorf("preparing signature update at %s: %w", tx.targetPath, err)
+		}
+		if err := os.Rename(linkPath, tx.targetPath); err != nil {
+			if recErr := os.Rename(backupPath, tx.targetPath); recErr != nil {
+				return fmt.Errorf("publishing signatures to %s: %w (and restoring the previous set failed: %v)",
+					tx.targetPath, err, recErr)
+			}
+			return fmt.Errorf("publishing signatures to %s: %w", tx.targetPath, err)
+		}
+		tx.removeObsoletePath(backupPath)
+
+	default:
+		return fmt.Errorf("unexpected file type at lookaside signature path %s", tx.targetPath)
+	}
+
+	linkPublished = true
+	tx.committed = true
+	if err := syncDirectory(tx.parentDir); err != nil {
+		logrus.Debugf("Error syncing lookaside signature directory %s: %v", tx.parentDir, err)
+	}
+	return nil
+}
+
+// abort discards an unpublished transaction. The previously published set, if any, is left in place.
+func (tx *lookasideSignatureTransaction) abort() {
+	if tx.setDir == "" || tx.committed {
+		return
+	}
+	if err := os.RemoveAll(tx.setDir); err != nil {
+		logrus.Debugf("Error removing unpublished lookaside signature staging directory %s: %v", tx.setDir, err)
+	}
+}
+
+// removeObsoletePath best-effort removes a set directory that is no longer referenced.
+func (tx *lookasideSignatureTransaction) removeObsoletePath(path string) {
+	if path == "" || path == tx.setDir || path == tx.targetPath {
+		return
+	}
+	if err := os.RemoveAll(path); err != nil {
+		// The next write attempt will clean it up via cleanupStaleObjects.
+		logrus.Debugf("Error removing obsolete lookaside signature set %s: %v", path, err)
+	}
+}
+
+// cleanupStaleObjects removes temporary objects left behind by interrupted attempts,
+// restoring the previous set if the visible path is missing but an .obsolete- backup exists.
+// The currently published set is never removed.
+func (tx *lookasideSignatureTransaction) cleanupStaleObjects() error {
+	fi, err := os.Lstat(tx.targetPath)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		restored, err := tx.restoreObsoleteBackup()
 		if err != nil {
 			return err
 		}
-		return nil
-
-	case "http", "https":
-		return fmt.Errorf("Writing directly to a %s lookaside %s is not supported. Configure a lookaside-staging: location", sigURL.Scheme, sigURL.Redacted())
-	default:
-		return fmt.Errorf("Unsupported scheme when writing signature to %s", sigURL.Redacted())
+		if restored {
+			fi, err = os.Lstat(tx.targetPath)
+			if err != nil {
+				return err
+			}
+		}
+	case err != nil:
+		return err
 	}
+
+	// The directory referenced by the visible symlink is the live set; keep it.
+	liveSet := ""
+	if fi != nil && fi.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Readlink(tx.targetPath)
+		if err != nil {
+			return fmt.Errorf("reading lookaside signature link %s: %w", tx.targetPath, err)
+		}
+		liveSet = filepath.Base(target)
+	}
+
+	entries, err := os.ReadDir(tx.parentDir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+
+	var errs []error
+	for _, entry := range entries {
+		name := entry.Name()
+		switch {
+		case strings.HasPrefix(name, tx.baseName+".set-"):
+			// Remove unpublished or superseded sets, never the live one.
+			if name == liveSet {
+				continue
+			}
+			if err := os.RemoveAll(filepath.Join(tx.parentDir, name)); err != nil {
+				errs = append(errs, fmt.Errorf("removing %s: %w", name, err))
+			}
+		case strings.HasPrefix(name, tx.baseName+".link-"):
+			// Temporary links are consumed by the commit; a surviving one is unpublished.
+			if err := os.Remove(filepath.Join(tx.parentDir, name)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				errs = append(errs, fmt.Errorf("removing %s: %w", name, err))
+			}
+		case strings.HasPrefix(name, tx.baseName+".obsolete-"):
+			// By now the visible path exists (it was restored, or it was never missing);
+			// the backup is no longer needed.
+			if err := os.RemoveAll(filepath.Join(tx.parentDir, name)); err != nil {
+				errs = append(errs, fmt.Errorf("removing %s: %w", name, err))
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// restoreObsoleteBackup, if the visible path is missing and one or more .obsolete- backups exist,
+// restores the most recent one as the visible path. It returns whether anything was restored.
+func (tx *lookasideSignatureTransaction) restoreObsoleteBackup() (bool, error) {
+	entries, err := os.ReadDir(tx.parentDir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	var newestEntry os.DirEntry
+	var newestInfo fs.FileInfo
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), tx.baseName+".obsolete-") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return false, err
+		}
+		if newestEntry == nil || info.ModTime().After(newestInfo.ModTime()) {
+			newestEntry, newestInfo = entry, info
+		}
+	}
+	if newestEntry == nil {
+		return false, nil
+	}
+	if err := os.Rename(filepath.Join(tx.parentDir, newestEntry.Name()), tx.targetPath); err != nil {
+		return false, fmt.Errorf("restoring the previous signature set to %s: %w", tx.targetPath, err)
+	}
+	return true, nil
+}
+
+// writeAndSyncFile writes contents to path (creating or truncating it) and syncs the file,
+// so that its contents are stable on the filesystem.
+func writeAndSyncFile(path string, contents []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(contents); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// syncDirectory syncs a directory, making file creation/removal within it durable.
+func syncDirectory(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	syncErr := f.Sync()
+	closeErr := f.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
+}
+
+// lookasideRandomSuffix returns an unguessable hexadecimal suffix for temporary objects.
+func lookasideRandomSuffix() (string, error) {
+	randomBytes := make([]byte, 8)
+	n, err := rand.Read(randomBytes)
+	if err != nil || n != len(randomBytes) {
+		return "", fmt.Errorf("generating random signature suffix: %w", err)
+	}
+	return hex.EncodeToString(randomBytes), nil
 }
 
 func (d *dockerImageDestination) putSignaturesToSigstoreAttachments(ctx context.Context, signatures []signature.Sigstore, manifestDigest digest.Digest) error {
@@ -834,24 +1151,51 @@ func (d *dockerImageDestination) putBlobBytesAsOCI(ctx context.Context, contents
 	}, nil
 }
 
-// deleteOneSignature deletes a signature from sigURL, if it exists.
-// If it successfully determines that the signature does not exist, returns (true, nil)
+// deleteLookasideSignatureSet deletes the whole signature set of manifestDigest from the lookaside,
+// including the transactional layout (the visible symlink and the set directory it references),
+// and cleans up stale temporary objects.
+// It is a no-op if the lookaside does not contain any signatures for the manifest.
 // NOTE: Keep this in sync with docs/signature-protocols.md!
-func (c *dockerClient) deleteOneSignature(sigURL *url.URL) (missing bool, err error) {
-	switch sigURL.Scheme {
-	case "file":
-		logrus.Debugf("Deleting %s", sigURL.Path)
-		err := os.Remove(sigURL.Path)
-		if err != nil && os.IsNotExist(err) {
-			return true, nil
-		}
-		return false, err
-
-	case "http", "https":
-		return false, fmt.Errorf("Writing directly to a %s lookaside %s is not supported. Configure a lookaside-staging: location", sigURL.Scheme, sigURL.Redacted())
-	default:
-		return false, fmt.Errorf("Unsupported scheme when deleting signature from %s", sigURL.Redacted())
+func (c *dockerClient) deleteLookasideSignatureSet(manifestDigest digest.Digest) error {
+	tx, err := newLookasideSignatureTransaction(c.signatureBase, manifestDigest)
+	if err != nil {
+		// Includes the "writing directly to an HTTP lookaside is not supported" error.
+		return err
 	}
+	if err := tx.cleanupStaleObjects(); err != nil {
+		logrus.Debugf("Error cleaning up stale lookaside signature objects at %s: %v", tx.targetPath, err)
+	}
+
+	fi, err := os.Lstat(tx.targetPath)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return nil // No signatures for this manifest.
+	case err != nil:
+		return err
+	case fi.Mode()&os.ModeSymlink != 0:
+		// Transactional layout: remove the link and the set directory it references.
+		target, err := os.Readlink(tx.targetPath)
+		if err != nil {
+			return fmt.Errorf("reading lookaside signature link %s: %w", tx.targetPath, err)
+		}
+		if err := os.Remove(tx.targetPath); err != nil {
+			return fmt.Errorf("deleting lookaside signature link %s: %w", tx.targetPath, err)
+		}
+		setPath := filepath.Join(tx.parentDir, filepath.Base(target))
+		if err := os.RemoveAll(setPath); err != nil {
+			return fmt.Errorf("deleting lookaside signature set %s: %w", setPath, err)
+		}
+	case fi.IsDir():
+		// Pre-transaction plain-directory layout.
+		if err := os.RemoveAll(tx.targetPath); err != nil {
+			return fmt.Errorf("deleting lookaside signature directory %s: %w", tx.targetPath, err)
+		}
+	default:
+		if err := os.Remove(tx.targetPath); err != nil {
+			return fmt.Errorf("deleting lookaside signature path %s: %w", tx.targetPath, err)
+		}
+	}
+	return nil
 }
 
 // putSignaturesToAPIExtension implements PutSignaturesWithFormat() using the X-Registry-Supports-Signatures API extension,

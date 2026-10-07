@@ -1,0 +1,10 @@
+{
+  "completion": "部分完成",
+  "fails": {
+    "1": "旧版普通目录迁移分支先将可见目录重命名为 obsolete，再重命名临时链接；两次重命名之间可见路径不存在，集合更新不是单次原子提交。",
+    "2": "普通目录迁移分支在旧目录与新链接之间存在可见空窗，读取端在该窗口无法看到旧集合或新集合。",
+    "4": "commit 的普通目录分支使用连续两次 Rename，进程在第二次 Rename 前终止时可见签名集合为空。",
+    "5": "普通目录迁移在第二次 Rename 前终止会留下 obsolete 备份且可见路径缺失；恢复依赖下一次写入触发 cleanupStaleObjects，当前进程退出时上一集合未保持可见。"
+  },
+  "evidence": "docker/docker_image_dest.go 的 lookasideSignatureTransaction stage/commit/cleanupStaleObjects；go test -race -count=1 ./docker 通过。"
+}

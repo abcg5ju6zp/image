@@ -59,6 +59,32 @@ then store the new signature using that _index_ value.
 There is no way to list existing signatures other than iterating through the successive _index_ values,
 and no way to download all of the signatures at once.
 
+### Atomic updates
+
+Updating a signature set (e.g. replacing a reordered copy) must never expose a partial set:
+a network failure or an aborted process could otherwise leave readers with a mix of old and new
+signatures, or with signatures that can no longer be verified.
+
+To make a full signature-set update a recoverable commit, a `file:///` writer does the following
+(all temporary objects live in the same directory as the visible _name_`@`_digest_ path):
+
+1. It creates an isolated directory _name_`@`_digest_`.set-`_random_, writes and syncs all the new
+   `signature-`_index_ files into it, and verifies them by reading the contents back.
+2. It creates a temporary relative symlink _name_`@`_digest_`.link-`_random_ pointing at the
+   `.set-` directory, and atomically renames it over the visible _name_`@`_digest_ path.
+   After that, the set directory replaced by the new one is deleted.
+3. If anything fails or is canceled before the rename, the `.set-` directory is deleted and the
+   previously visible set is untouched.
+
+Readers (whether using `file:///`, or an HTTP server serving the same directory) transparently
+follow the symlink, so they always see either the complete previous set or the complete new set;
+readers do not need to be modified to support this. A signature set stored as a plain directory
+by older writers is migrated to the symlink layout on the first update; the plain directory is
+moved to a _name_`@`_digest_`.obsolete-`_random_ name first, and if a crash leaves no visible
+path, the next attempt restores it. Unpublished `.set-` and `.link-` objects of aborted attempts,
+and any leftover `.obsolete-` backups, are cleaned up on the next write (even a write carrying
+no signatures).
+
 ### Examples
 
 For a docker/distribution image available as `busybox@sha256:817a12c32a39bbe394944ba49de563e085f1d3c5266eb8e9723256bc4448680e`
